@@ -6,7 +6,8 @@ import simpy
 import structlog
 
 import config
-from peers import User, Collator
+from peers import *
+from messages import *
 
 
 def setup_network(env):

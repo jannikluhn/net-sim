@@ -1,8 +1,10 @@
 from collections import defaultdict
 from itertools import count
-import structlog
+import math
 import random
-import simpy
+
+import structlog
+
 import config
 from messages import NewTransactionsMessage, CollationMessage
 
@@ -20,10 +22,11 @@ class Peer(object):
         self.logger = structlog.get_logger(self.__class__.__name__ + str(self.instance_number))
         self.logger = self.logger.bind(node=self)
 
-        self.uplink = simpy.Container(self.env, init=uplink)
-        self.downlink = simpy.Container(self.env, init=downlink)
-        self.send_processes = []
-        self.receive_processes = []
+        self.uplink = uplink
+        self.downlink = downlink
+
+        self.uplink_allocations = []  # [(bandwidth, used until), ...]
+        self.downlink_allocations = []  # [(bandwidth, used until), ...]
 
         self.peers = []
 
@@ -35,42 +38,64 @@ class Peer(object):
             self.env.process(service.start())
 
     def send(self, message, receiver):
+        # don't send message if receiver isn't interested
         if not any(isinstance(message, MessageType) for MessageType in receiver.accepted_messages):
-            return  # don't send message if receiver isn't interested
-        def _send():
-            transmitted = 0
-            complete = False
-            while not complete:
-                # find available bandwidth (can be zero)
-                bandwidth = min(self.uplink.level, receiver.downlink.level)
-                # consume bandwidth
-                if bandwidth > 0:
-                    self.uplink.get(bandwidth)
-                    receiver.downlink.get(bandwidth)
-                # send message
-                start = self.env.now
-                try:
-                    to_transmit = float(message.size) - transmitted
-                    time = to_transmit / bandwidth if bandwidth != 0 else float('inf')
-                    yield self.env.timeout(time)
-                except simpy.Interrupt:
-                    # interrupted because other process finished, redistributing bandwidth
-                    pass
-                else:
-                    complete = True
-                transmitted += bandwidth * (self.env.now - start)
-                if bandwidth > 0:
-                    self.uplink.put(bandwidth)
-                    receiver.downlink.put(bandwidth)
-            # transfer finished, interrupt all other transfers to redistribute bandwidth
-            self.send_processes.remove(proc)
-            receiver.receive_processes.remove(proc)
-            for process in self.send_processes + receiver.receive_processes:
-                process.interrupt()
-            receiver.receive(message, self)
-        proc = self.env.process(_send())
-        self.send_processes.append(proc)
-        receiver.receive_processes.append(proc)
+            return
+        transmitted = 0
+        not_transmitted = message.size
+        time = self.env.now
+
+        uplink_allocations = iter(self.uplink_allocations)
+        downlink_allocations = iter(receiver.downlink_allocations)
+        new_uplink_allocations = []
+        new_downlink_allocations = []
+
+        # skip historic allocations
+        uplink_used_until = -math.inf
+        while uplink_used_until < self.env.now:
+            uplink_used, uplink_used_until = next(uplink_allocations, (0, math.inf))
+        downlink_used_until = -math.inf
+        while downlink_used_until < self.env.now:
+            downlink_used, downlink_used_until = next(downlink_allocations, (0, math.inf))
+
+        while True:
+            # check how much bandwidth is available
+            if time >= uplink_used_until:
+                uplink_used, uplink_used_until = next(uplink_allocations, (0, math.inf))
+            if time >= downlink_used_until:
+                downlink_used, downlink_used_until = next(uplink_allocations, (0, math.inf))
+
+            # allocate bandwidth
+            bandwidth = min(self.uplink - uplink_used, receiver.downlink - downlink_used)
+            expected_transmission_time = float(not_transmitted) / bandwidth
+            bandwidth_used_until = min([
+                uplink_used_until,
+                downlink_used_until,
+                time + expected_transmission_time
+            ])
+            new_uplink_allocations.append((uplink_used + bandwidth, bandwidth_used_until))
+            new_downlink_allocations.append((downlink_used + bandwidth, bandwidth_used_until))
+
+            # calculate transmission time
+            transmitted += bandwidth * (bandwidth_used_until - time)
+            not_transmitted = message.size - transmitted
+            time = bandwidth_used_until
+            if math.isclose(not_transmitted, 0):
+                break
+
+        # replay other allocations
+        new_uplink_allocations.append((uplink_used, uplink_used_until))
+        new_downlink_allocations.append((downlink_used, downlink_used_until))
+        for uplink_used, uplink_used_until in uplink_allocations:
+            new_uplink_allocations.append((uplink_used, uplink_used_until))
+        for downlink_used, downlink_used_until in downlink_allocations:
+            new_downlink_allocations.append((downlink_used, downlink_used_until))
+        self.uplink_allocations = new_uplink_allocations
+        receiver.downlink_allocations = new_downlink_allocations
+
+        # sleep and receive
+        yield self.env.timeout(time - self.env.now)
+        receiver.receive(message, self)
 
     def receive(self, message, sender):
         for service in self.services:
