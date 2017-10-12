@@ -60,9 +60,9 @@ class TxDistributionService(Service):
                     self.peer_to_known_txs[other].update(new_txs)
             # forget messages that everyone knows about
             txs_to_drop = set.intersection(*list(self.peer_to_known_txs.values()) or [set()])
-            self.known_txs.intersection_update(txs_to_drop)
+            self.known_txs.difference_update(txs_to_drop)
             for known_by_peer in self.peer_to_known_txs.values():
-                known_by_peer.intersection_update(txs_to_drop)
+                known_by_peer.difference_update(txs_to_drop)
             yield self.env.timeout(self.resend_interval)
 
 
@@ -82,10 +82,6 @@ class TxDistributionService(Service):
                 time=self.env.now,
                 **{'from': sender}
             )
-
-    def add_tx(self, tx):
-        self.known_txs.add(tx)
-        self.n_txs += 1
 
 
 class TxSpawnService(Service):

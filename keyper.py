@@ -4,67 +4,41 @@ import random
 from main import Peer, Service, Message
 
 
-SecretShare = namedtuple('SecretShare', ['block', 'sender', 'receiver'])
-SecretShareWitness = namedtuple('SecretShareWitness', ['block', 'sender'])
-Nonce = namedtuple('Nonce', ['block', 'sender'])
-EncKeyShare = namedtuple('EncKeyShare', ['block', 'sender'])
+SecretShare = namedtuple('SecretShare', ['sender', 'receiver', 'block'])
+SecretShareWitness = namedtuple('SecretShareWitness', ['sender', 'block'])
+Nonce = namedtuple('Nonce', ['sender', 'block'])
+EncKeyShare = namedtuple('EncKeyShare', ['sender', 'block'])
 # DecKeyShare = namedtuple('DecKeyShare', ['block', 'sender'])
 
 
-class SecretSharesMessage(Message):
+class ThresholdEncryptionUpdates(Message):
 
-    def __init__(self, secret_shares):
-        self.secret_shares = secret_shares
+    secret_share_size = 2 * 32 + 2 * 20  # two secret numbers, two addresses
+    witness_size = 32 + 20  # witness, address
+    nonce_size = 32 + 20  # nonce, address
 
-    @property
-    def size(self):
-        # two 256 bit values, two addresses, block number
-        return self.base_size + (2 * 32 + 2 * 20 + 32) * len(self.secret_shares)
-
-
-class SecretShareWitnessesMessage(Message):
-
-    def __init__(self, secret_share_witnesses):
-        self.secret_share_witnesses = secret_share_witnesses
+    def __init__(self, block, secret_shares=None, witnesses=None, nonces=None):
+        self.block = block
+        self.secret_shares = secret_shares or set()
+        self.witnesses = witnesses or set()
+        self.nonces = nonces or set()
 
     @property
     def size(self):
-        # one 256 bit value, one address, block number
-        return self.base_size + (32 + 20 + 32) * len(self.secret_share_witnesses)
-
-
-class NoncesMessage(Message):
-
-    def __init__(self, nonces):
-        self.nonces = nonces
-
-    @property
-    def size(self):
-        # nonce, address, block number
-        return self.base_size + (32 + 20 + 32) * len(self.nonces)
-
-
-class EncKeySharesMessage(Message):
-
-    def __init__(self, enc_key_shares):
-        self.enc_key_shares = []
-
-    @property
-    def size(self):
-        return self.base_size + (32 + 20 + 32) * len(self.enc_key_shares)
-
-
-# class DecKeySharesMessage(Message):
+        return sum([
+            self.base_size,
+            32,  # block number
+            len(self.secret_shares) * self.secret_share_size,
+            len(self.witnesses) * self.witness_size,
+            len(self.nonces) + self.nonce_size
+        ])
 
 
 class Keyper(Peer):
 
     instance_counter = count()
     accepted_messages = [
-        SecretSharesMessage,
-        SecretShareWitnessesMessage,
-        NoncesMessage,
-        EncKeySharesMessage
+        ThresholdEncryptionUpdates
     ]
 
     def __init__(self, env, uplink, downlink, keyper_number, threshold, ):
@@ -90,35 +64,26 @@ class ThresholdEncryptionProtocol():
         self.n = n
         self.k = k
         self.my_id = my_id
-        self.keypers_with_secret_shares = set()
-        self.keypers_with_secret_share_witnesses = set()
-        self.keypers_with_nonces = set()
-        self.keypers_with_enc_key_share = set()
+        self.secret_shares = set()
+        self.witnesses = set()
+        self.nonces = set()
+        self.enc_key_shares = set()
         # self.keypers_with_dec_key_share = set()
 
-    def register_secret_share(self, sender):
-        if sender != self.my_id:
-            self.keypers_with_secret_shares.add(sender)
-
-    def register_secret_share_witness(self, sender):
-        if sender != self.my_id:
-            self.keypers_with_secret_share_witnesses.add(sender)
-
-    def register_nonce(self, sender):
-        if sender != self.my_id:
-            self.keypers_with_nonces.add(sender)
-
-    def register_enc_key_share(self, sender):
-        if sender != self.my_id:
-            self.keypers_with_enc_key_share.add(sender)
-
     def key_distribution_finished(self):
-        received_secret_shares = len(self.keypers_with_secret_shares)
-        received_witnesses = len(self.keypers_with_secret_share_witnesses)
-        return received_secret_shares == received_witnesses == self.n - 1
+        block = next(secret_share.block for secret_share in self.secret_shares)
+        assert all(secret_share.block == block for secret_share in self.secret_shares)
+        assert all(witness.block == block for witness in self.witnesses)
+        assert all(secret_share.sender != self.my_id for secret_share in self.secret_shares)
+        assert all(witness.sender != self.my_id for witness in self.witnesses)
+        assert all(witness.receiver == self.my_id for witness in self.witnesses)
+        return len(self.secret_shares) == len(self.witnesses) == self.n - 1
 
     def nonce_collection_finished(self):
-        return self.key_distribution_finished() and len(self.keypers_with_nonces) == self.n - 1
+        block = next(nonce.block for nonce in self.nonces)
+        assert all(nonce.block == block for nonce in self.nonces)
+        assert all(nonce.sender != self.my_id for nonce in self.nonces)
+        return self.key_distribution_finished() and len(self.nonces) == self.n - 1
 
 
 class ThresholdEncryptionService(Service):
@@ -127,84 +92,87 @@ class ThresholdEncryptionService(Service):
         super().__init__(env, peer)
         self.n = n
         self.k = k
+        self.id = self.peer.instance_number
         self.protocols = {}
-        self.current_protocol = 0
+        self.current_block = 0
         self.peer_to_known_secret_shares = {}
         self.peer_to_known_secret_share_witnesses = {}
         self.peer_to_known_nonces = {}
         self.peer_to_known_enc_key_shares = {}
 
     def handle_message(self, message, sender):
-        if not isinstance(message, (
-            SecretSharesMessage,
-            SecretShareWitnessesMessage,
-            NoncesMessage,
-            EncKeySharesMessage
-        )):
+        if not isinstance(message, ThresholdEncryptionUpdates):
             return
 
-        if isinstance(message, SecretSharesMessage):
-            for block, sender, receiver in message.secret_shares:
-                if block not in self.protocols:
-                    self.kickoff_protocol(block)
-                if receiver == self.peer.instance_number:
-                    protocol = self.protocols[block]
-                    protocol.register_secret_share(sender)
-                    if protocol.key_distribution_finished():
-                        self.send_nonce(block)
+        block = message.block
+        if block not in self.protocols and block >= self.current_block:
+            self.kickoff_protocol(block)
+        protocol = self.protocols[block]
 
-        if isinstance(message, SecretShareWitnessesMessage):
-            for block, sender in message.secret_share_witnesses:
-                if block not in self.protocols:
-                    self.kickoff_protocol(block)
-                protocol = self.protocols[block]
-                protocol.register_secret_share_witness(sender)
-                if protocol.key_distribution_finished():
-                    self.send_nonce(block)
+        for secret_share in message.secret_shares:
+            assert secret_share.block == block
+            if secret_share.receiver != self.id:
+                continue
+            if secret_share in protocol.secret_shares:
+                continue
+            protocol.secret_shares.add(secret_share)
+            if protocol.key_distribution_finished():
+                self.send_nonce(block)
+        
+        for witness in message.witnesses:
+            assert witness.block == block
+            if witness in protocol.witnesses:
+                continue
+            protocol.witnesses.add(witness)
+            if protocol.key_distribution_finished():
+                self.send_nonce(block)
 
-        if isinstance(message, NoncesMessage):
-            for block, sender in message.nonces:
-                if block not in self.protocols:
-                    self.kickoff_protocol(block) 
-                protocol = self.protocols[block]
-                protocol.register_nonce(sender)
-                if protocol.nonce_collection_finished():
-                    self.send_enc_key_share(block)
-                    if block == self.current_protocol:
-                        self.current_protocol += 1
-                        if self.current_protocol not in self.protocols:
-                            self.kickoff_protocol(self.current_protocol)
+        for nonce in message.nonces:
+            assert nonce.block == block
+            if nonce in protocol.nonces:
+                continue
+            protocol.nonces.add(nonce)
+            if protocol.nonce_collection_finished():
+                self.send_enc_key_share(block)
+
+        # start protocol for next block if current one has finished
+        current_protocol = self.protocols.get(self.current_block, None)
+        if current_protocol and current_protocol.nonce_collection_finished():
+            self.protocols.pop(self.current_block)
+            self.current_block += 1
+            if self.current_block not in self.protocols:
+                self.kickoff_protocol(self.current_block)
 
     def kickoff_protocol(self, block):
         """Initialize protocol and transmit your secret shares and witnesses."""
         assert block not in self.protocols
         self.logger.info('kicking of protocol', block=block, time=self.env.now)
-        protocol = ThresholdEncryptionProtocol(self.n, self.k, self.peer.instance_number)
+        protocol = ThresholdEncryptionProtocol(self.n, self.k, self.id)
         self.protocols[block] = protocol
         my_witness = SecretShareWitness(block, self.peer.instance_number)
         self.peer.threshold_distribution_service.witnesses.add(my_witness)
-        my_id = self.peer.instance_number
-        for i in chain(range(0, my_id), range(my_id + 1, self.n)):
-            secret_share = SecretShare(block, self.peer.instance_number, i)
+        for i in chain(range(0, self.id), range(self.id + 1, self.n)):
+            secret_share = SecretShare(block, self.id, i)
             self.peer.threshold_distribution_service.secret_shares.add(secret_share)
 
     def send_nonce(self, block):
-        my_nonce = Nonce(block, self.peer.instance_number)
+        my_nonce = Nonce(block, self.id)
         if my_nonce not in self.peer.threshold_distribution_service.nonces:
             self.logger.info('publishing nonce', block=block, time=self.env.now)
             self.peer.threshold_distribution_service.nonces.add(my_nonce)
     
     def send_enc_key_share(self, block):
-        my_enc_share = EncKeyShare(block, self.peer.instance_number)
+        pass
+        # my_enc_share = EncKeyShare(block, self.id)
         # if my_enc_share not in self.peer.threshold_distribution_service.enc_key_shares:
         #     self.logger.info('publishing encryption key share', block=block, time=self.env.now)
         #     self.peer.threshold_distribution_service.enc_key_shares.add(my_enc_share)
 
     def start(self):
         yield self.env.timeout(random.random() * 1)
-        assert self.current_protocol == 0
-        if self.current_protocol not in self.protocols:
-            self.kickoff_protocol(self.current_protocol)
+        assert self.current_block == 0
+        if self.current_block not in self.protocols:
+            self.kickoff_protocol(self.current_block)
 
 
 class ThresholdMessageDistributionService(Service):
@@ -220,32 +188,50 @@ class ThresholdMessageDistributionService(Service):
         self.peer_to_known_nonces = defaultdict(set)
 
     def handle_message(self, message, sender):
-        if isinstance(message, SecretSharesMessage):
-            self.secret_shares |= message.secret_shares
-            self.peer_to_known_secret_shares[sender] |= message.secret_shares
-        if isinstance(message, SecretShareWitnessesMessage):
-            self.witnesses |= message.secret_share_witnesses
-            self.peer_to_known_witnesses[sender] |= message.secret_share_witnesses
-        if isinstance(message, NoncesMessage):
-            self.nonces |= message.nonces
-            self.peer_to_known_nonces[sender] |= message.nonces
+        if not isinstance(message, ThresholdEncryptionUpdates):
+            return
+
+        # remember received data (and that sender knows them too)
+        self.secret_shares |= message.secret_shares
+        self.peer_to_known_secret_shares[sender] |= message.secret_shares
+        self.witnesses |= message.witnesses
+        self.peer_to_known_witnesses[sender] |= message.witnesses
+        self.nonces |= message.nonces
+        self.peer_to_known_nonces[sender] |= message.nonces
+
+        # forget data that all my peers know about
+        secret_shares = list(self.peer_to_known_secret_shares.values())
+        common_secret_shares = set.intersection(*secret_shares or [set()])
+        self.secret_shares.difference_update(common_secret_shares)
+        for known_by_peer in self.peer_to_known_secret_shares.values():
+            known_by_peer.difference_update(common_secret_shares)
+        witnesses = list(self.peer_to_known_witnesses.values())
+        common_witnesses = set.intersection(*witnesses or [set()])
+        self.witnesses.difference_update(common_witnesses)
+        for known_by_peer in self.peer_to_known_witnesses.values():
+            known_by_peer.difference_update(common_witnesses)
+        nonces = list(self.peer_to_known_nonces.values())
+        common_nonces = set.intersection(*nonces or [set()])
+        self.nonces.difference_update(common_nonces)
+        for known_by_peer in self.peer_to_known_nonces.values():
+            known_by_peer.difference_update(common_nonces)
 
     def start(self):
         # make sure not everyone starts at same time
         yield self.env.timeout(random.random() * self.resend_interval)
         while True:
             for other in self.peer.peers:
-                messages = []
                 new_secret_shares = self.secret_shares - self.peer_to_known_secret_shares[other]
                 new_witnesses = self.witnesses - self.peer_to_known_witnesses[other]
                 new_nonces = self.nonces - self.peer_to_known_nonces[other]
-                if new_secret_shares:
-                    # TODO only broadcast if not directly connected
-                    messages.append(SecretSharesMessage(new_secret_shares))
-                if new_witnesses:
-                    messages.append(SecretShareWitnessesMessage(new_witnesses))
-                if new_nonces:
-                    messages.append(NoncesMessage(new_nonces))
-                for message in messages:
-                    self.env.process(self.peer.send(message, other))
+                if new_secret_shares or new_witnesses or new_nonces:
+                    blocks = [d.block for d in
+                              set.union(new_secret_shares, new_witnesses, new_nonces)]
+                    for block in blocks:
+                        message = ThresholdEncryptionUpdates(
+                            block,
+                            set(d for d in new_secret_shares if d.block == block),
+                            set(d for d in new_witnesses if d.block == block),
+                            set(d for d in new_nonces if d.block == block))
+                        self.env.process(self.peer.send(message, other))
             yield self.env.timeout(self.resend_interval)
