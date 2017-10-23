@@ -1,7 +1,17 @@
 from collections import defaultdict, namedtuple
 from itertools import chain, count
 import random
-from main import Peer, Service, Message, SecretShare, Witness, Nonce
+from main import (
+    Peer,
+    Service,
+    Message,
+    SecretShare,
+    Witness,
+    Nonce,
+    EncKeyShare,
+    DecKeyShare,
+    Collation
+)
 
 
 class Keyper(Peer):
@@ -80,6 +90,9 @@ class ThresholdEncryptionService(Service):
             yield self.env.process(self.collect_secrets())
             self.send_nonce()
             yield self.env.process(self.collect_nonces())
+            self.send_enc_key_share()
+            yield self.env.process(self.wait_for_collation())
+            self.send_dec_key_share()
 
             self.current_block += 1
 
@@ -136,6 +149,31 @@ class ThresholdEncryptionService(Service):
             nonces = set(item for item in items if item.sender != self.my_id)
             self.current_protocol.nonces |= nonces
             processed_nonces |= items
+
+    def send_enc_key_share(self):
+        """Send the encryption key share."""
+        self.logger.info('sending enc key share', block=self.current_block, time=self.env.now)
+        assert self.current_protocol.nonce_collection_finished()
+        enc_key_share = EncKeyShare(self.current_block, self.peer.instance_number)
+        self.peer.distributor.distribute(enc_key_share)
+
+    def wait_for_collation(self):
+        """Wait for the collation for the current block."""
+        self.logger.info('waiting for collation', block=self.current_block, time=self.env.now)
+        collations = set()
+        while not collations:
+            collations = yield self.env.process(self.peer.distributor.get_items(
+                Collation.type_id,
+                self.current_block
+            ))
+            assert len(collations) <= 1
+
+    def send_dec_key_share(self):
+        """Send the decryption key share."""
+        self.logger.info('sending dec key share', block=self.current_block, time=self.env.now)
+        assert self.current_protocol.nonce_collection_finished()
+        dec_key_share = DecKeyShare(self.current_block, self.peer.instance_number)
+        self.peer.distributor.distribute(dec_key_share)
 
     @property
     def current_protocol(self):

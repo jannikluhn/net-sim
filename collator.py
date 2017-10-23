@@ -1,64 +1,55 @@
 from itertools import count
-from main import Message, Peer, Service
-from user import NewTransactionsMessage
+from main import Message, Peer, Service, Collation, Transaction
 
 
-class CollationMessage(Message):
+class Collator(Peer):
 
-    def __init__(self, transactions):
-        self.transactions = transactions
+    instance_counter = count()
 
-    @property
-    def size(self):
-        return self.base_size + sum(len(tx) for tx in self.transactions)
-
-    def __repr__(self):
-        return '<CollationMessage n={}>'.format(len(self.transactions))
+    def __init__(self, env, uplink, downlink, collation_interval):
+        super().__init__(env, uplink, downlink)
+        self.collation_service = CollationService(env, self, collation_interval)
+        self.services.append(self.collation_service)
 
 
 class CollationService(Service):
 
     def __init__(self, env, peer, collation_interval):
         super().__init__(env, peer)
-        self.txs = set()
-        self.n_txs = 0
-        self.n_colls = 0
         self.collation_interval = collation_interval
-    
+        self.next_collation_block = 0
+        self.collation_size = 0
+
     def start(self):
+        transaction_watcher = self.env.process(self.watch_transactions())
+        collation_creator = self.env.process(self.create_collations())
+        yield self.env.all_of([transaction_watcher, collation_creator])
+
+    def watch_transactions(self):
+        current_block = self.next_collation_block
+        processed = set()
+        while True:
+            if current_block != self.next_collation_block:
+                processed = set()
+                self.collation_size = 0
+                current_block += 1
+            transactions = yield self.env.process(self.peer.distributor.get_items(
+                Transaction.type_id,
+                current_block,
+                exclude=processed
+            ))
+            self.collation_size += len(transactions - processed)
+            processed |= transactions
+
+    def create_collations(self):
         while True:
             yield self.env.timeout(self.collation_interval)
-            txs = list(self.txs)
-            self.txs.clear()
-            message = CollationMessage(txs)
-            self.n_colls += 1
-            self.logger.info('created collation', n=self.n_colls, txs=len(txs), time=self.env.now)
-            for other in self.peer.peers:
-                self.peer.send(message, other)
-
-    def handle_message(self, message, sender):
-        if isinstance(message, NewTransactionsMessage):
-            n_txs_before = len(self.txs)
-            self.txs.update(message.transactions)
-            n_txs_after = len(self.txs)
-            n_new = n_txs_after - n_txs_before
-            self.n_txs += n_new
-            self.logger.debug('received txs',
-                peer=sender,
-                n=len(message.transactions),
-                known=len(message.transactions) - n_new,
-                total=self.n_txs,
+            self.logger.info(
+                'creating collation',
+                block=self.next_collation_block,
+                txs=self.collation_size,
                 time=self.env.now
             )
-
-
-class Collator(Peer):
-
-    instance_counter = count()
-    accepted_messages = [NewTransactionsMessage]
-
-    def __init__(self, env, uplink, downlink, collation_interval):
-        super().__init__(env, uplink, downlink)
-        self.collation_interval = collation_interval
-        self.collation_service = CollationService(env, self, collation_interval)
-        self.services.append(self.collation_service)
+            collation = Collation(self.next_collation_block, self.peer.instance_number)
+            self.peer.distributor.distribute(collation)
+            self.next_collation_block += 1

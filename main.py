@@ -1,8 +1,10 @@
 from collections import defaultdict, namedtuple
 from collections.abc import Container
-from itertools import count
+from itertools import count, dropwhile
 import math
 import random
+
+import config
 
 from simpy.events import AllOf
 import structlog
@@ -107,6 +109,13 @@ class Transaction(Item):
     size = Item.size + 100
     type_id = next(Item.item_type_counter)
 
+    def __init__(self, block):
+        super().__init__(block)
+        self.hash_ = random.randint(0, 2**32)
+
+    def __hash__(self):
+        return self.hash_
+
 
 class SecretShare(AddressedItem):
 
@@ -144,6 +153,108 @@ class Vote(SignedItem):
     type_id = next(Item.item_type_counter)
 
 
+class Collation(SignedItem):
+
+    size = Item.size + config.TX_SIZE * config.TX_RATE *  config.COLLATION_INTERVAL
+    type_id = next(Item.item_type_counter)
+
+
+def calc_charge(message_size, channels, start_time):
+    """Calculate the additional bandwidth used to transmit a message of certain size.
+
+    The available bandwidth is given for each charged channel (usually uplink of sender and
+    downlink of receiver) as a list of `(bandwidth, time)` tuples specifying the bandwidth that is
+    available until a certain time.
+
+    The result is returned in the same format, but with opposite sign: Instead of the available
+    the additionally used bandwidth is specified.
+    """
+    assert all(channels)
+    assert all(math.isclose(channel[-1][1], math.inf) for channel in channels)
+
+    not_transmitted = message_size
+    time = start_time
+
+    channels = [iter(channel) for channel in channels]
+    charge = [(0, start_time)]
+
+    currently_available_bandwidths = [0] * len(channels)
+    next_bandwidth_changes = [-math.inf] * len(channels)
+
+    while not_transmitted > 0 and not math.isclose(not_transmitted, 0, abs_tol=0.1):
+        # get available bandwidth for each channel at current time
+        for i, channel in enumerate(channels):
+            while next_bandwidth_changes[i] <= time:
+                available, next_change = next(channel)
+                currently_available_bandwidths[i] = available
+                next_bandwidth_changes[i] = next_change
+
+        # bandwidth that we can use at current time and time during which bandwidths don't change
+        bandwidth = min(currently_available_bandwidths)
+        next_bandwidth_change = min(next_bandwidth_changes)
+
+        # transmit until either transmission is finished or bandwidth changes
+        if bandwidth == 0:
+            charge_until = next_bandwidth_change
+        else:
+            charge_until = min(
+                next_bandwidth_change,
+                time + not_transmitted / bandwidth
+            )
+        charge.append((bandwidth, charge_until))
+        not_transmitted -= bandwidth * (charge_until - time)
+        if not charge_until > time:
+            import pudb.b
+        # assert charge_until > time
+        time = charge_until
+    return charge
+
+
+def charge_channel(channel, charge):
+    """Create a new channel object."""
+    assert math.isclose(channel[-1][1], math.inf)
+
+    new_channel = []
+    channel_iter = iter(channel)
+    charge_iter = iter(charge)
+
+    available, available_until = next(channel_iter)
+    added, added_until = next(charge_iter)
+    assert math.isclose(added, 0, abs_tol=0.1)
+
+    # insert new allocations
+    while True:
+        new_available = available - added
+        assert new_available >= 0
+        new_channel.append((new_available, min(added_until, available_until)))
+        assert len(new_channel) <= 1 or new_channel[-1][1] > new_channel[-2][1]
+        if added_until < available_until:
+            try:
+                added, added_until = next(charge_iter)
+            except StopIteration:
+                break
+        elif added_until > available_until:
+            available, available_until = next(channel_iter)
+        else:
+            available, available_until = next(channel_iter)
+            try:
+                added, added_until = next(charge_iter)
+            except StopIteration:
+                break
+
+    # replay old allocations
+    new_channel.append((available, available_until))
+    for available, available_until in channel_iter:
+        new_channel.append((available, available_until))
+
+    return new_channel
+
+
+def expected_transmission_time(message_size, channels, start_time):
+    charge = calc_charge(message_size, channels, start_time)
+    return charge[-1][1] - start_time
+
+
 class Peer(object):
     """A node in the network."""
 
@@ -157,11 +268,12 @@ class Peer(object):
         self.logger = structlog.get_logger(self.__class__.__name__ + str(self.instance_number))
         self.logger = self.logger.bind(node=self)
 
-        self.uplink = uplink
-        self.downlink = downlink
+        self.max_uplink = uplink
+        self.max_downlink = downlink
 
-        self.uplink_allocations = []  # [(bandwidth, used until), ...]
-        self.downlink_allocations = []  # [(bandwidth, used until), ...]
+        # [(available bandwidth, available until), ...]
+        self.uplink_channel = [(self.max_uplink, math.inf)]
+        self.downlink_channel = [(self.max_downlink, math.inf)]
 
         self.transmission_events_by_peer = defaultdict(list)
 
@@ -178,62 +290,18 @@ class Peer(object):
 
     def send(self, message, receiver):
         """Send a message to a connected peer."""
-        # don't send message if receiver isn't interested
-        transmitted = 0
-        not_transmitted = message.size
-        time = self.env.now
-
-        uplink_allocations = iter(self.uplink_allocations)
-        downlink_allocations = iter(receiver.downlink_allocations)
-        new_uplink_allocations = []
-        new_downlink_allocations = []
-
-        # skip historic allocations
-        uplink_used_until = -math.inf
-        while uplink_used_until < self.env.now:
-            uplink_used, uplink_used_until = next(uplink_allocations, (0, math.inf))
-        downlink_used_until = -math.inf
-        while downlink_used_until < self.env.now:
-            downlink_used, downlink_used_until = next(downlink_allocations, (0, math.inf))
-
-        while not math.isclose(transmitted, message.size):
-            # check how much bandwidth is available
-            if time >= uplink_used_until:
-                uplink_used, uplink_used_until = next(uplink_allocations, (0, math.inf))
-            if time >= downlink_used_until:
-                downlink_used, downlink_used_until = next(uplink_allocations, (0, math.inf))
-
-            # allocate bandwidth
-            bandwidth = min(self.uplink - uplink_used, receiver.downlink - downlink_used)
-            if bandwidth != 0:
-                expected_transmission_time = float(not_transmitted) / bandwidth
-            else:
-                expected_transmission_time = math.inf
-            bandwidth_used_until = min([
-                uplink_used_until,
-                downlink_used_until,
-                time + expected_transmission_time
-            ])
-            new_uplink_allocations.append((uplink_used + bandwidth, bandwidth_used_until))
-            new_downlink_allocations.append((downlink_used + bandwidth, bandwidth_used_until))
-
-            # calculate transmission time
-            transmitted += bandwidth * (bandwidth_used_until - time)
-            not_transmitted = message.size - transmitted
-            time = bandwidth_used_until
-
-        # replay other allocations
-        new_uplink_allocations.append((uplink_used, uplink_used_until))
-        new_downlink_allocations.append((downlink_used, downlink_used_until))
-        for uplink_used, uplink_used_until in uplink_allocations:
-            new_uplink_allocations.append((uplink_used, uplink_used_until))
-        for downlink_used, downlink_used_until in downlink_allocations:
-            new_downlink_allocations.append((downlink_used, downlink_used_until))
-        self.uplink_allocations = new_uplink_allocations
-        receiver.downlink_allocations = new_downlink_allocations
-
-        # sleep and receive
-        transmission_event = self.env.timeout(time - self.env.now)
+        charge = calc_charge(
+            message.size,
+            [self.uplink_channel, receiver.downlink_channel],
+            self.env.now
+        )
+        self.uplink_channel = charge_channel(self.uplink_channel, charge)
+        receiver.downlink_channel = charge_channel(receiver.downlink_channel, charge)
+        past_predicate = lambda t: t[1] < self.env.now
+        self.uplink_channel = list(dropwhile(past_predicate, self.uplink_channel))
+        receiver.downlink_channel = list(dropwhile(past_predicate, receiver.downlink_channel))
+        arrival_time = charge[-1][1]
+        transmission_event = self.env.timeout(arrival_time - self.env.now)
         self.transmission_events_by_peer[receiver].append(transmission_event)
         yield transmission_event
         self.transmission_events_by_peer[receiver].remove(transmission_event)
@@ -292,13 +360,13 @@ class ItemDistributorService(Service):
             items = set(message.items)
             self.items_by_peer[sender] |= items
             n_new = len(items - self.known_items)
-            logger.info('receiving announcement', total=len(items), new=n_new)
+            # logger.info('receiving announcement', total=len(items), new=n_new)
             self.known_items |= items
         if isinstance(message, SendItems):
             # take note of newly fetched items
             items = set(message.items)
             n_new = len(items - self.fetched_items)
-            logger.info('receiving items', total=len(items), new=n_new)
+            # logger.info('receiving items', total=len(items), new=n_new)
             self.items_by_peer[sender] |= items
             self.known_items |= items
             self.fetched_items |= items
@@ -312,7 +380,7 @@ class ItemDistributorService(Service):
                 for item in self.fetched_items:
                     if hash(item) == hash_:
                         items.add(item)
-            logger.info('receiving request', total=len(message.hashes), known=len(items))
+            # logger.info('receiving request', total=len(message.hashes), known=len(items))
             reply = SendItems(items)
             self.env.process(self.peer.send(reply, sender))
 

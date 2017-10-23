@@ -5,8 +5,8 @@ import simpy
 import structlog
 
 import config
-from networks import keyper_network
-
+from networks import full_network
+from main import ItemDistributorService
 
 
 class LogFilter(object):
@@ -29,7 +29,8 @@ if __name__ == '__main__':
     structlog.configure(
         processors=[
             LogFilter({
-                #'node': lambda p: isinstance(p, Keyper)
+                # 'node': lambda p: isinstance(p, Keyper)
+                # 'service': lambda s: s == ItemDistributorService
             }),
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
@@ -39,14 +40,15 @@ if __name__ == '__main__':
     )
 
     env = simpy.Environment()
-    network = keyper_network(
-        env,
-        config.KEYPER_UPLINK,
-        config.KEYPER_DOWNLINK,
-        config.N_KEYPERS,
-        config.KEYPER_THRESHOLD,
-        config.N_KEYPER_CONNECTIONS
-    )
-    for peer in network:
+    users, collator, keypers, validators = full_network(env)
+    for peer in users + [collator] + keypers + validators:
         peer.start()
+    # class M:
+    #     size = 10
+    # from main import *
+    # peer1 = Peer(env, 10, 10)
+    # peer2 = Peer(env, 10, 4)
+    # peer3 = Peer(env, 10, 5)
+    # env.process(peer1.send(M(), peer2))
+    # env.process(peer1.send(M(), peer3))
     env.run(50)
